@@ -16,6 +16,12 @@
 #include <unistd.h>
 
 namespace od {
+namespace {
+
+/// A receiver that has not drained a frame for this long is gone or unreachable.
+constexpr auto sendTimeout = std::chrono::seconds(2);
+
+}  // namespace
 
 Session::Session(Options options, std::unique_ptr<DesktopBackend> desktop)
     : options_(std::move(options)), desktop_(std::move(desktop)) {
@@ -125,8 +131,10 @@ bool Session::send(const std::string_view payload) {
     if (!connected_.load() || !socket_.valid()) {
         return false;
     }
-    if (!socket_.writeAll(framed)) {
-        connected_.store(false);
+    if (!socket_.writeAll(framed, sendTimeout)) {
+        if (connected_.exchange(false)) {
+            log("Receiver stopped reading; disconnecting");
+        }
         return false;
     }
     return true;
@@ -202,6 +210,10 @@ void Session::receiveLoop() {
 }
 
 bool Session::tick() {
+    if (const auto encoderError = encoder_.failure(); !encoderError.empty()) {
+        stop();
+        throw std::runtime_error("FFmpeg encoder failed: " + encoderError);
+    }
     if (const auto captureError = capture_.error()) {
         throw std::runtime_error("PipeWire capture failed: " + *captureError);
     }
@@ -252,16 +264,16 @@ bool Session::tick() {
 }
 
 void Session::stop() {
-    stopPipeline();
+    // Wake blocked reads and writes first, so the encoder and receiver threads can be joined
+    // even when the peer stopped draining. The descriptor stays open until they have.
     connected_.store(false);
-    {
-        std::lock_guard lock(sendMutex_);
-        socket_.close();
-    }
+    socket_.shutdown();
     helloCondition_.notify_all();
+    stopPipeline();
     if (receiver_.joinable()) {
         receiver_.join();
     }
+    socket_.close();
     {
         std::lock_guard lock(stateMutex_);
         phone_.reset();

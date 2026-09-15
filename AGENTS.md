@@ -2,10 +2,11 @@
 
 ## Project Structure & Module Organization
 
-OpenDisplay contains two native apps and a landing site. `Mac/` implements the macOS sender; `iOS/` implements the receiver and video renderer. Shared target code lives in `Shared/`, especially the wire protocol. XcodeGen reads `project.yml`; generated `OpenSidecar.xcodeproj` and `Mac/Info.plist`/`iOS/Info.plist` must not be edited or committed. The React/Vite site lives in `src/`, with static assets in `public/` and helpers in `tools/`. Release automation is under `fastlane/` and `.github/workflows/`.
+OpenDisplay contains two native apps and a landing site. `Mac/` implements the macOS sender; `iOS/` implements the receiver and video renderer. `Linux/` implements the Linux sender with CMake and CTest. Shared target code lives in `Shared/`, especially the wire protocol. XcodeGen reads `project.yml`; generated `OpenSidecar.xcodeproj` and `Mac/Info.plist`/`iOS/Info.plist` must not be edited or committed. The React/Vite site lives in `src/`, with static assets in `public/` and helpers in `tools/`. Release automation is under `fastlane/` and `.github/workflows/`.
 
 ## Build, Test, and Development Commands
 
+- Linux CLI: `cmake -S Linux -B build/linux -DCMAKE_BUILD_TYPE=Release -DOPENDISPLAY_BUILD_GUI=OFF`, `cmake --build build/linux -j4`, then `ctest --test-dir build/linux --output-on-failure`.
 - `./generate.sh` loads the optional `.env` signing team and regenerates the Xcode project. Install XcodeGen first.
 - `xcodebuild -project OpenSidecar.xcodeproj -scheme OpenSidecarMac -configuration Debug -derivedDataPath build build` builds the macOS sender.
 - `xcodebuild -project OpenSidecar.xcodeproj -scheme OpenSidecariOS -configuration Debug -destination 'generic/platform=iOS' -derivedDataPath build -allowProvisioningUpdates build` builds the receiver.
@@ -19,7 +20,7 @@ Follow existing formatting: four-space indentation in Swift and two spaces in Ty
 
 ## Testing Guidelines
 
-There is currently no committed automated test target or coverage threshold. Before submitting, build every affected native scheme and run `pnpm build` for website changes. Exercise transport or rendering changes with the iOS receiver and macOS sender; `tools/fake-receiver.swift` is available for focused sender diagnostics. Document tested devices, OS versions, USB/WiFi paths, and permission states in the PR.
+Linux has committed CTest targets for display layout, desktop selection, wire format, encoding, PipeWire formats, and sockets. For Linux-only changes, build the Linux sender and run CTest; do not require Xcode or website builds. Build affected Apple schemes for Apple changes and run `pnpm build` for website changes. Exercise transport or rendering changes with the iOS receiver and the affected sender; `tools/fake-receiver.swift` is available for focused sender diagnostics. Document tested devices, OS versions, USB/WiFi paths, and permission states in the PR.
 
 ## Commit & Pull Request Guidelines
 

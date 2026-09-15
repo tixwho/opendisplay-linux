@@ -2,7 +2,15 @@
 
 #include "opendisplay/log.hpp"
 
+extern "C" {
+#include <libavcodec/packet.h>
+#include <libavformat/avformat.h>
+#include <libavformat/avio.h>
+#include <libavutil/mem.h>
+}
+
 #include <fcntl.h>
+#include <spawn.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -15,6 +23,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
+
+extern char** environ;
 
 namespace od {
 namespace {
@@ -71,14 +81,6 @@ bool writeAll(const int fd, const std::string_view bytes) {
     return true;
 }
 
-std::size_t startCodeLength(const std::string_view bytes, const std::size_t position) {
-    if (position + 3 < bytes.size() && bytes[position] == 0 && bytes[position + 1] == 0
-        && bytes[position + 2] == 0 && bytes[position + 3] == 1) {
-        return 4;
-    }
-    return 3;
-}
-
 std::size_t findStartCode(const std::string_view bytes, const std::size_t from) {
     for (std::size_t index = from; index + 2 < bytes.size(); ++index) {
         if (bytes[index] == 0 && bytes[index + 1] == 0
@@ -89,6 +91,61 @@ std::size_t findStartCode(const std::string_view bytes, const std::size_t from) 
         }
     }
     return std::string::npos;
+}
+
+// FFmpeg's bitstream filters mix three- and four-byte delimiters. The iOS
+// receiver recognizes only the four-byte form, matching the macOS sender.
+std::string withFourByteStartCodes(const std::string_view packet) {
+    std::string annexB;
+    annexB.reserve(packet.size() + 16);
+    std::size_t position = findStartCode(packet, 0);
+    while (position != std::string::npos) {
+        if (packet[position + 2] == 1) {
+            annexB.push_back('\0');
+        }
+        const auto next = findStartCode(packet, position + 3);
+        annexB.append(packet.substr(position, next - position));
+        position = next;
+    }
+    return annexB;
+}
+
+/// Starts `argv` with `stdinFd` and `stdoutFd` as its standard streams. Every
+/// other descriptor of this process is close-on-exec. Returns an errno value.
+int spawn(char* const argv[], const int stdinFd, const int stdoutFd, pid_t& pid) {
+    posix_spawn_file_actions_t actions;
+    int error = ::posix_spawn_file_actions_init(&actions);
+    if (error != 0) {
+        return error;
+    }
+    // A pipe end that already sits on 0 or 1 keeps its number; dup2 onto the
+    // same descriptor only clears close-on-exec.
+    error = ::posix_spawn_file_actions_adddup2(&actions, stdinFd, STDIN_FILENO);
+    if (error == 0) {
+        error = ::posix_spawn_file_actions_adddup2(&actions, stdoutFd, STDOUT_FILENO);
+    }
+    if (error == 0) {
+        error = ::posix_spawnp(&pid, argv[0], &actions, nullptr, argv, environ);
+    }
+    ::posix_spawn_file_actions_destroy(&actions);
+    return error;
+}
+
+int readPipe(void* opaque, std::uint8_t* buffer, const int size) {
+    const int fd = static_cast<int>(reinterpret_cast<std::intptr_t>(opaque));
+    for (;;) {
+        const auto count = ::read(fd, buffer, static_cast<std::size_t>(size));
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < 0) {
+            return AVERROR(errno);
+        }
+        if (count == 0) {
+            return AVERROR_EOF;
+        }
+        return static_cast<int>(count);
+    }
 }
 
 }  // namespace
@@ -106,6 +163,7 @@ void FfmpegEncoder::start(EncoderConfig config, FrameCallback callback) {
         std::lock_guard lock(mutex_);
         running_ = true;
         restartRequested_ = false;
+        failure_ = nullptr;
     }
     worker_ = std::thread(&FfmpegEncoder::run, this);
 }
@@ -134,6 +192,9 @@ void FfmpegEncoder::stop() {
         std::lock_guard lock(mutex_);
         running_ = false;
         pending_.reset();
+        if (childPid_ > 0) {
+            ::kill(childPid_, SIGKILL);
+        }
     }
     condition_.notify_all();
     if (worker_.joinable()) {
@@ -143,6 +204,41 @@ void FfmpegEncoder::stop() {
 }
 
 std::string FfmpegEncoder::selectedEncoder() const { return encoderName(selected_); }
+
+std::string FfmpegEncoder::failure() const {
+    std::exception_ptr error;
+    {
+        std::lock_guard lock(mutex_);
+        error = failure_;
+    }
+    if (!error) {
+        return {};
+    }
+    try {
+        std::rethrow_exception(error);
+    } catch (const std::exception& failure) {
+        return failure.what();
+    } catch (...) {
+        return "Unknown encoder error";
+    }
+}
+
+void FfmpegEncoder::fail(std::exception_ptr error) {
+    {
+        std::lock_guard lock(mutex_);
+        if (!running_ || processStopping_) {
+            return;
+        }
+        // Preserve the exception without allocating from a failing reader thread.
+        failure_ = std::move(error);
+        running_ = false;
+        pending_.reset();
+        if (childPid_ > 0) {
+            ::kill(childPid_, SIGKILL);
+        }
+    }
+    condition_.notify_all();
+}
 
 EncoderKind FfmpegEncoder::chooseEncoder() const {
     if (config_.kind != EncoderKind::Auto) {
@@ -182,57 +278,66 @@ std::vector<std::string> FfmpegEncoder::arguments(const VideoFormat& input) cons
 
     const std::string scale = "scale=" + std::to_string(outputWidth) + ':'
         + std::to_string(outputHeight) + ":flags=fast_bilinear";
+    // iPad hardware decoders accept 8-bit 4:2:0 only; without an explicit
+    // format libx264 would pick High 4:4:4 Predictive for RGB input.
     if (selected_ == EncoderKind::Vaapi) {
-        args.insert(args.end(), {"-vf", scale + ",format=nv12,hwupload", "-c:v", "h264_vaapi"});
+        args.insert(args.end(), {"-vf", scale + ",format=nv12,hwupload", "-c:v", "h264_vaapi",
+                                 "-async_depth", "1"});
     } else if (selected_ == EncoderKind::Nvenc) {
-        args.insert(args.end(), {"-vf", scale, "-c:v", "h264_nvenc", "-preset", "p1",
-                                 "-tune", "ull", "-delay", "0"});
+        args.insert(args.end(), {"-vf", scale + ",format=yuv420p", "-c:v", "h264_nvenc",
+                                 "-preset", "p1", "-tune", "ull", "-delay", "0"});
     } else {
-        args.insert(args.end(), {"-vf", scale, "-c:v", "libx264", "-preset", "ultrafast",
-                                 "-tune", "zerolatency",
-                                 "-x264-params", "repeat-headers=1:aud=1"});
+        args.insert(args.end(), {"-vf", scale + ",format=yuv420p", "-c:v", "libx264",
+                                 "-preset", "ultrafast", "-tune", "zerolatency"});
+    }
+    // NUT carries packet boundaries, so the reader emits each access unit as
+    // soon as FFmpeg flushes it instead of waiting for the next start code.
+    // NUT takes SPS and PPS as global headers. libx264 and NVENC then leave
+    // them out of the stream, so dump_extra puts that one copy in front of
+    // every keyframe; VA-API writes its own copy in front of every IDR.
+    std::string filters = "h264_metadata=aud=insert";
+    if (selected_ != EncoderKind::Vaapi) {
+        filters += ",dump_extra=freq=keyframe";
     }
     args.insert(args.end(), {
         "-bf", "0", "-g", std::to_string(std::max(config_.fps * 60, config_.fps)),
         "-b:v", std::to_string(config_.bitrate), "-maxrate", std::to_string(config_.bitrate),
         "-bufsize", std::to_string(std::max(config_.bitrate / 2, 1)),
-        "-bsf:v", "h264_metadata=aud=insert,dump_extra=freq=keyframe",
-        "-f", "h264", "pipe:1",
+        "-bsf:v", filters, "-f", "nut", "-flush_packets", "1", "pipe:1",
     });
     return args;
 }
 
 void FfmpegEncoder::startProcess(const VideoFormat& input) {
+    std::lock_guard lock(mutex_);
+    if (!running_) {
+        return;
+    }
+    processStopping_ = false;
     int inputPipe[2]{};
     int outputPipe[2]{};
-    if (::pipe2(inputPipe, O_CLOEXEC) != 0 || ::pipe2(outputPipe, O_CLOEXEC) != 0) {
-        if (inputPipe[0] > 0) ::close(inputPipe[0]);
-        if (inputPipe[1] > 0) ::close(inputPipe[1]);
-        throw std::runtime_error("cannot create FFmpeg pipes");
+    if (::pipe2(inputPipe, O_CLOEXEC) != 0) {
+        throw std::runtime_error("cannot create FFmpeg input pipe");
+    }
+    if (::pipe2(outputPipe, O_CLOEXEC) != 0) {
+        ::close(inputPipe[0]); ::close(inputPipe[1]);
+        throw std::runtime_error("cannot create FFmpeg output pipe");
     }
     const auto args = arguments(input);
-    const pid_t pid = ::fork();
-    if (pid < 0) {
-        ::close(inputPipe[0]); ::close(inputPipe[1]);
-        ::close(outputPipe[0]); ::close(outputPipe[1]);
-        throw std::runtime_error("cannot fork FFmpeg");
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& argument : args) {
+        argv.push_back(const_cast<char*>(argument.c_str()));
     }
-    if (pid == 0) {
-        ::dup2(inputPipe[0], STDIN_FILENO);
-        ::dup2(outputPipe[1], STDOUT_FILENO);
-        ::close(inputPipe[0]); ::close(inputPipe[1]);
-        ::close(outputPipe[0]); ::close(outputPipe[1]);
-        std::vector<char*> argv;
-        argv.reserve(args.size() + 1);
-        for (const auto& argument : args) {
-            argv.push_back(const_cast<char*>(argument.c_str()));
-        }
-        argv.push_back(nullptr);
-        ::execvp(argv.front(), argv.data());
-        _exit(127);
-    }
+    argv.push_back(nullptr);
+    pid_t pid = -1;
+    const int error = spawn(argv.data(), inputPipe[0], outputPipe[1], pid);
     ::close(inputPipe[0]);
     ::close(outputPipe[1]);
+    if (error != 0) {
+        ::close(inputPipe[1]); ::close(outputPipe[0]);
+        throw std::runtime_error(std::string("cannot start ffmpeg: ") + std::strerror(error));
+    }
     inputFd_ = inputPipe[1];
     outputFd_ = outputPipe[0];
     childPid_ = static_cast<int>(pid);
@@ -241,6 +346,13 @@ void FfmpegEncoder::startProcess(const VideoFormat& input) {
 }
 
 void FfmpegEncoder::stopProcess() {
+    {
+        std::lock_guard lock(mutex_);
+        processStopping_ = true;
+        if (childPid_ > 0) {
+            ::kill(childPid_, SIGKILL);
+        }
+    }
     if (inputFd_ >= 0) {
         ::close(inputFd_);
         inputFd_ = -1;
@@ -249,10 +361,13 @@ void FfmpegEncoder::stopProcess() {
         reader_.join();
     }
     outputFd_ = -1;
-    if (childPid_ > 0) {
-        int status = 0;
-        while (::waitpid(childPid_, &status, 0) < 0 && errno == EINTR) {}
-        childPid_ = -1;
+    {
+        std::lock_guard lock(mutex_);
+        if (childPid_ > 0) {
+            int status = 0;
+            while (::waitpid(childPid_, &status, 0) < 0 && errno == EINTR) {}
+            childPid_ = -1;
+        }
     }
     inputFormat_ = {};
     {
@@ -292,88 +407,70 @@ void FfmpegEncoder::run() {
                 timestamps_.push_back(frame.capturedAtMs);
             }
             if (!writeAll(inputFd_, frame.bytes)) {
-                log("FFmpeg stopped accepting frames; restarting it");
-                stopProcess();
-                startProcess(frame.format);
-                {
-                    std::lock_guard lock(mutex_);
-                    timestamps_.push_back(frame.capturedAtMs);
-                }
-                if (!writeAll(inputFd_, frame.bytes)) {
-                    throw std::runtime_error("FFmpeg encoder pipe failed");
-                }
+                throw std::runtime_error("FFmpeg encoder pipe failed");
             }
         }
-    } catch (const std::exception& error) {
-        log(std::string("Encoder error: ") + error.what());
-        std::lock_guard lock(mutex_);
-        running_ = false;
+    } catch (...) {
+        fail(std::current_exception());
     }
     stopProcess();
 }
 
 void FfmpegEncoder::readOutput(const int fd) {
-    std::array<char, 64 * 1024> buffer{};
-    std::string pending;
-    std::string accessUnit;
-    bool hasVcl = false;
-    for (;;) {
-        const auto count = ::read(fd, buffer.data(), buffer.size());
-        if (count < 0 && errno == EINTR) {
-            continue;
+    constexpr int bufferSize = 64 * 1024;
+    unsigned char* buffer = nullptr;
+    AVIOContext* io = nullptr;
+    AVFormatContext* format = nullptr;
+    AVPacket* packet = nullptr;
+    try {
+        buffer = static_cast<unsigned char*>(av_malloc(bufferSize));
+        if (buffer == nullptr) {
+            throw std::runtime_error("cannot allocate FFmpeg input buffer");
         }
-        if (count <= 0) {
-            break;
+        io = avio_alloc_context(buffer, bufferSize, 0,
+                                reinterpret_cast<void*>(static_cast<std::intptr_t>(fd)),
+                                &readPipe, nullptr, nullptr);
+        if (io == nullptr) {
+            throw std::runtime_error("cannot allocate FFmpeg input context");
         }
-        pending.append(buffer.data(), static_cast<std::size_t>(count));
-        for (;;) {
-            const auto first = findStartCode(pending, 0);
-            if (first == std::string::npos) {
-                break;
-            }
-            if (first > 0) {
-                pending.erase(0, first);
-            }
-            const auto next = findStartCode(pending, startCodeLength(pending, 0));
-            if (next == std::string::npos) {
-                break;
-            }
-            auto nal = pending.substr(0, next);
-            pending.erase(0, next);
-            consumeNal(std::move(nal), accessUnit, hasVcl);
+        format = avformat_alloc_context();
+        packet = av_packet_alloc();
+        if (format == nullptr || packet == nullptr) {
+            throw std::runtime_error("cannot allocate FFmpeg demuxer");
         }
+        format->pb = io;
+        // NUT headers name the codec. Parsing would hold the last frame back.
+        format->flags |= AVFMT_FLAG_CUSTOM_IO | AVFMT_FLAG_NOPARSE | AVFMT_FLAG_NOFILLIN;
+        int result = avformat_open_input(&format, nullptr, av_find_input_format("nut"), nullptr);
+        if (result < 0) {
+            throw std::runtime_error("FFmpeg produced no NUT stream (error "
+                                     + std::to_string(result) + ')');
+        }
+        while ((result = av_read_frame(format, packet)) >= 0) {
+            const std::string_view payload(reinterpret_cast<const char*>(packet->data),
+                                          static_cast<std::size_t>(packet->size));
+            emitPacket(withFourByteStartCodes(payload), (packet->flags & AV_PKT_FLAG_KEY) != 0);
+            av_packet_unref(packet);
+        }
+        throw std::runtime_error("FFmpeg output ended (error " + std::to_string(result) + ')');
+    } catch (...) {
+        fail(std::current_exception());
     }
-    if (!pending.empty() && findStartCode(pending, 0) == 0) {
-        consumeNal(std::move(pending), accessUnit, hasVcl);
-    }
-    if (hasVcl && !accessUnit.empty()) {
-        emitAccessUnit(std::move(accessUnit));
+    avformat_close_input(&format);
+    av_packet_free(&packet);
+    if (io != nullptr) {
+        av_freep(&io->buffer);
+        avio_context_free(&io);
+    } else {
+        av_free(buffer);
     }
     ::close(fd);
 }
 
-void FfmpegEncoder::consumeNal(std::string nal, std::string& accessUnit, bool& hasVcl) {
-    const auto prefix = startCodeLength(nal, 0);
-    if (nal.size() <= prefix) {
+void FfmpegEncoder::emitPacket(std::string annexB, const bool keyframe) {
+    if (annexB.empty()) {
         return;
     }
-    const int type = static_cast<unsigned char>(nal[prefix]) & 0x1f;
-    // FFmpeg's Annex-B muxer may mix three- and four-byte delimiters. The
-    // existing iOS receiver intentionally recognizes only the four-byte form,
-    // matching the macOS sender, so normalize every NAL before transmission.
-    if (prefix == 3) {
-        nal.insert(nal.begin(), '\0');
-    }
-    if (type == 9 && hasVcl) {
-        emitAccessUnit(std::move(accessUnit));
-        accessUnit.clear();
-        hasVcl = false;
-    }
-    accessUnit.append(nal);
-    hasVcl = hasVcl || (type >= 1 && type <= 5);
-}
-
-void FfmpegEncoder::emitAccessUnit(std::string accessUnit) {
     std::int64_t timestamp = wallClockMs();
     {
         std::lock_guard lock(mutex_);
@@ -382,19 +479,9 @@ void FfmpegEncoder::emitAccessUnit(std::string accessUnit) {
             timestamps_.pop_front();
         }
     }
-    bool keyframe = false;
-    for (std::size_t position = findStartCode(accessUnit, 0); position != std::string::npos;) {
-        const auto prefix = startCodeLength(accessUnit, position);
-        if (position + prefix < accessUnit.size()
-            && (static_cast<unsigned char>(accessUnit[position + prefix]) & 0x1f) == 5) {
-            keyframe = true;
-            break;
-        }
-        position = findStartCode(accessUnit, position + prefix);
-    }
     if (callback_) {
         callback_(EncodedFrame{.capturedAtMs = timestamp, .keyframe = keyframe,
-                               .annexB = std::move(accessUnit)});
+                               .annexB = std::move(annexB)});
     }
 }
 

@@ -2,6 +2,7 @@
 
 #include "opendisplay/types.hpp"
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <span>
@@ -22,9 +23,13 @@ public:
     [[nodiscard]] int fd() const { return fd_; }
     [[nodiscard]] bool valid() const { return fd_ >= 0; }
     int release();
+    /// Wakes every thread blocked in readExact or writeAll on this socket; they return false.
+    /// Keeps the descriptor open, so callers can still use it until they have joined.
+    void shutdown();
     void close();
     bool readExact(std::span<char> destination);
-    bool writeAll(std::string_view bytes);
+    /// Sends every byte within a total deadline of `timeout`.
+    bool writeAll(std::string_view bytes, std::chrono::milliseconds timeout);
 
 private:
     int fd_ = -1;

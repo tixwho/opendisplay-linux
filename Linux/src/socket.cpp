@@ -9,29 +9,38 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 
 namespace od {
 namespace {
 
-bool waitForSocket(const int fd, const short events) {
+using Clock = std::chrono::steady_clock;
+
+/// Waits for `events`, or forever without a deadline. A shutdown ends the wait with
+/// POLLHUP, which reports false to the caller.
+bool waitForSocket(const int fd, const short events, const std::optional<Clock::time_point> deadline) {
     pollfd descriptor{.fd = fd, .events = events, .revents = 0};
     for (;;) {
-        const int result = ::poll(&descriptor, 1, -1);
+        int timeoutMs = -1;
+        if (deadline) {
+            const auto now = Clock::now();
+            if (now >= *deadline) {
+                return false;
+            }
+            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(*deadline - now);
+            timeoutMs = static_cast<int>(std::max<std::chrono::milliseconds::rep>(0, remaining.count()));
+        }
+        const int result = ::poll(&descriptor, 1, timeoutMs);
         if (result < 0 && errno == EINTR) {
             continue;
         }
-        if (result <= 0) {
-            return false;
-        }
-        if ((descriptor.revents & events) != 0) {
-            return true;
-        }
-        return false;
+        return result > 0 && (descriptor.revents & events) != 0;
     }
 }
 
@@ -57,9 +66,14 @@ int Socket::release() {
     return result;
 }
 
-void Socket::close() {
+void Socket::shutdown() {
     if (fd_ >= 0) {
         ::shutdown(fd_, SHUT_RDWR);
+    }
+}
+
+void Socket::close() {
+    if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
     }
@@ -68,7 +82,8 @@ void Socket::close() {
 bool Socket::readExact(const std::span<char> destination) {
     std::size_t offset = 0;
     while (offset < destination.size()) {
-        const auto count = ::recv(fd_, destination.data() + offset, destination.size() - offset, 0);
+        const auto count = ::recv(fd_, destination.data() + offset, destination.size() - offset,
+                                  MSG_DONTWAIT);
         if (count == 0) {
             return false;
         }
@@ -77,7 +92,7 @@ bool Socket::readExact(const std::span<char> destination) {
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (waitForSocket(fd_, POLLIN)) {
+                if (waitForSocket(fd_, POLLIN, std::nullopt)) {
                     continue;
                 }
             }
@@ -88,16 +103,21 @@ bool Socket::readExact(const std::span<char> destination) {
     return true;
 }
 
-bool Socket::writeAll(const std::string_view bytes) {
+bool Socket::writeAll(const std::string_view bytes, const std::chrono::milliseconds timeout) {
+    const auto deadline = Clock::now() + timeout;
     std::size_t offset = 0;
     while (offset < bytes.size()) {
-        const auto count = ::send(fd_, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
+        if (Clock::now() >= deadline) {
+            return false;
+        }
+        const auto count = ::send(fd_, bytes.data() + offset, bytes.size() - offset,
+                                  MSG_NOSIGNAL | MSG_DONTWAIT);
         if (count < 0) {
             if (errno == EINTR) {
                 continue;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                if (waitForSocket(fd_, POLLOUT)) {
+                if (waitForSocket(fd_, POLLOUT, deadline)) {
                     continue;
                 }
             }

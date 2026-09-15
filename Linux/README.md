@@ -157,6 +157,10 @@ opendisplay-linux --transport wifi --host 192.168.1.40 --port 9000
 ```
 
 `--encoder auto` prefers VA-API, then NVENC, and falls back to `libx264`.
+Every encoder emits 8-bit 4:2:0 H.264 so the iPad hardware decoder accepts
+it. FFmpeg writes packetized NUT to the sender, which reads packet boundaries
+with libavformat and forwards each access unit as Annex B without waiting for
+the next frame.
 Use `Linux/tools/fake_receiver.py` to exercise the TCP framing without an iOS
 device; it does not decode video or advertise Bonjour.
 
