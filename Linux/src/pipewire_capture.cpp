@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <variant>
 
 namespace od {
 namespace {
@@ -28,12 +29,12 @@ const pw_stream_events streamEvents = [] {
     return events;
 }();
 
-std::optional<VideoFormat::PixelFormat> pixelFormat(const spa_video_format format) {
+std::optional<AVPixelFormat> pixelFormat(const spa_video_format format) {
     switch (format) {
-    case SPA_VIDEO_FORMAT_BGRA: return VideoFormat::PixelFormat::Bgra;
-    case SPA_VIDEO_FORMAT_BGRx: return VideoFormat::PixelFormat::Bgrx;
-    case SPA_VIDEO_FORMAT_RGBA: return VideoFormat::PixelFormat::Rgba;
-    case SPA_VIDEO_FORMAT_RGBx: return VideoFormat::PixelFormat::Rgbx;
+    case SPA_VIDEO_FORMAT_BGRA: return AV_PIX_FMT_BGRA;
+    case SPA_VIDEO_FORMAT_BGRx: return AV_PIX_FMT_BGR0;
+    case SPA_VIDEO_FORMAT_RGBA: return AV_PIX_FMT_RGBA;
+    case SPA_VIDEO_FORMAT_RGBx: return AV_PIX_FMT_RGB0;
     default: return std::nullopt;
     }
 }
@@ -53,7 +54,8 @@ const char* pixelFormatName(const spa_video_format format) {
 PipeWireCapture::~PipeWireCapture() { stop(); }
 
 void PipeWireCapture::start(const int remoteFd, const std::uint32_t nodeId, const int width,
-                            const int height, const int fps, FrameCallback callback) {
+                            const int height, const int outputWidth, const int outputHeight,
+                            const int fps, FrameCallback callback) {
     stop();
     {
         std::lock_guard lock(stateMutex_);
@@ -64,6 +66,15 @@ void PipeWireCapture::start(const int remoteFd, const std::uint32_t nodeId, cons
     std::call_once(initialized, [] { pw_init(nullptr, nullptr); });
 
     callback_ = std::move(callback);
+    outputWidth_ = outputWidth;
+    outputHeight_ = outputHeight;
+    try {
+        converter_.emplace();
+    } catch (...) {
+        ::close(remoteFd);
+        stop();
+        throw;
+    }
     loop_ = pw_thread_loop_new("opendisplay-capture", nullptr);
     if (loop_ == nullptr) {
         ::close(remoteFd);
@@ -150,6 +161,7 @@ void PipeWireCapture::stop() {
         pw_thread_loop_destroy(loop_);
         loop_ = nullptr;
     }
+    converter_.reset();
     callback_ = {};
     format_ = {};
 }
@@ -216,50 +228,88 @@ void PipeWireCapture::handleProcess() {
     if (pipewireBuffer == nullptr) {
         return;
     }
-    auto* buffer = pipewireBuffer->buffer;
-    if (buffer->n_datas == 0 || buffer->datas[0].data == nullptr
-        || buffer->datas[0].chunk == nullptr || format_.size.width == 0) {
-        pw_stream_queue_buffer(stream_, pipewireBuffer);
+    // Staging copies the rows out of the mapped buffer, so the buffer goes
+    // back to PipeWire on every path below, exactly once, before the scaling
+    // starts: the stream keeps a free buffer to capture the next frame into
+    // while this thread converts the last one.
+    std::optional<StagedFrame> staged = stageBuffer(*pipewireBuffer->buffer);
+    pw_stream_queue_buffer(stream_, pipewireBuffer);
+    if (!staged) {
         return;
     }
+    std::optional<CapturedFrame> frame = convertStaged(std::move(*staged));
+    if (frame && callback_) {
+        callback_(std::move(*frame));
+    }
+}
 
-    const auto& data = buffer->datas[0];
-    const auto* chunk = data.chunk;
+std::optional<PipeWireCapture::StagedFrame> PipeWireCapture::stageBuffer(
+    const spa_buffer& buffer) {
+    if (buffer.n_datas == 0 || format_.size.width == 0) {
+        return std::nullopt;
+    }
+    const auto& data = buffer.datas[0];
     const auto width = static_cast<int>(format_.size.width);
     const auto height = static_cast<int>(format_.size.height);
-    const int sourceStride = chunk->stride > 0 ? chunk->stride : width * 4;
-    const int targetStride = width * 4;
-    const auto required = static_cast<std::uint64_t>(chunk->offset)
-        + static_cast<std::uint64_t>(sourceStride) * static_cast<std::uint64_t>(height - 1)
-        + static_cast<std::uint64_t>(targetStride);
-    if (sourceStride < targetStride || required > data.maxsize) {
-        pw_stream_queue_buffer(stream_, pipewireBuffer);
-        return;
+    const auto chunk = rgbChunk(data, width, height);
+    if (!chunk) {
+        return std::nullopt;
     }
-    const auto* source = static_cast<const char*>(data.data) + chunk->offset;
 
-    CapturedFrame frame;
-    frame.format = VideoFormat{
-        .width = width,
-        .height = height,
-        .stride = targetStride,
+    StagedFrame staged;
+    staged.frame.format = VideoFormat{
+        .width = outputWidth_,
+        .height = outputHeight_,
+        .stride = outputWidth_,
         .fps = format_.framerate.denom > 0
             ? static_cast<int>(format_.framerate.num / format_.framerate.denom)
             : 60,
-        .pixelFormat = *pixelFormat(format_.format),
     };
-    frame.capturedAtMs = wallClockMs();
-    frame.sequence = sequence_.fetch_add(1);
-    frame.bytes.resize(static_cast<std::size_t>(targetStride * height));
-    for (int row = 0; row < height; ++row) {
-        std::memcpy(frame.bytes.data() + static_cast<std::size_t>(row * targetStride),
-                    source + static_cast<std::size_t>(row * sourceStride),
-                    static_cast<std::size_t>(targetStride));
+    staged.frame.capturedAtMs = wallClockMs();
+    staged.frame.sequence = sequence_.fetch_add(1);
+    if (std::holds_alternative<NeutralChunk>(*chunk)) {
+        // The plane holds no picture, so none of its bytes are read.
+        staged.neutral = true;
+        return staged;
     }
-    pw_stream_queue_buffer(stream_, pipewireBuffer);
-    if (callback_) {
-        callback_(std::move(frame));
+
+    // The converter copies the rows into its own padded storage, so the
+    // mapped PipeWire buffer is never handed to libswscale directly.
+    const auto& layout = std::get<RgbChunkLayout>(*chunk);
+    const Rgb32Image image{
+        .rows = static_cast<const std::uint8_t*>(data.data) + layout.offset,
+        .stride = layout.stride,
+        .width = width,
+        .height = height,
+        .format = *pixelFormat(format_.format),
+    };
+    try {
+        converter_->stage(image);
+    } catch (const std::exception& exception) {
+        recordConversionFailure(exception);
+        return std::nullopt;
     }
+    return staged;
+}
+
+std::optional<CapturedFrame> PipeWireCapture::convertStaged(StagedFrame staged) {
+    if (staged.neutral) {
+        staged.frame.bytes = blackNv12(outputWidth_, outputHeight_);
+        return std::move(staged.frame);
+    }
+    try {
+        staged.frame.bytes = converter_->convert(outputWidth_, outputHeight_);
+    } catch (const std::exception& exception) {
+        recordConversionFailure(exception);
+        return std::nullopt;
+    }
+    return std::move(staged.frame);
+}
+
+void PipeWireCapture::recordConversionFailure(const std::exception& exception) {
+    log(std::string("PipeWire frame conversion failed: ") + exception.what());
+    std::lock_guard lock(stateMutex_);
+    error_ = exception.what();
 }
 
 }  // namespace od

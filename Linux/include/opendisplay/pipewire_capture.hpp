@@ -1,5 +1,6 @@
 #pragma once
 
+#include "opendisplay/nv12_converter.hpp"
 #include "opendisplay/types.hpp"
 
 #include <pipewire/pipewire.h>
@@ -8,6 +9,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -24,8 +26,10 @@ public:
     PipeWireCapture(const PipeWireCapture&) = delete;
     PipeWireCapture& operator=(const PipeWireCapture&) = delete;
 
-    void start(int remoteFd, std::uint32_t nodeId, int width, int height, int fps,
-               FrameCallback callback);
+    /// Delivers NV12 frames of `outputWidth` x `outputHeight`, converted and
+    /// scaled from the negotiated `width` x `height` RGB stream.
+    void start(int remoteFd, std::uint32_t nodeId, int width, int height, int outputWidth,
+               int outputHeight, int fps, FrameCallback callback);
     void stop();
     [[nodiscard]] std::optional<std::string> error() const;
 
@@ -37,7 +41,22 @@ public:
     static void process(void* data);
 
 private:
+    /// One dequeued buffer whose pixels have left the PipeWire memory: the
+    /// frame properties, plus either the rows staged in the converter or a
+    /// chunk that was flagged empty. The NV12 bytes are made afterwards, with
+    /// the buffer already back in PipeWire's hands.
+    struct StagedFrame {
+        CapturedFrame frame;
+        bool neutral = false;  ///< the chunk was flagged empty: the picture is black
+    };
+
     void handleProcess();
+    /// Copies one dequeued buffer's rows into the converter; nothing for a
+    /// buffer that fails the chunk contract or the copy.
+    std::optional<StagedFrame> stageBuffer(const spa_buffer& buffer);
+    /// Scales and packs a staged frame; nothing when libswscale rejects it.
+    std::optional<CapturedFrame> convertStaged(StagedFrame staged);
+    void recordConversionFailure(const std::exception& exception);
 
     pw_thread_loop* loop_ = nullptr;
     pw_context* context_ = nullptr;
@@ -45,6 +64,9 @@ private:
     pw_stream* stream_ = nullptr;
     spa_hook listener_{};
     spa_video_info_raw format_{};
+    std::optional<Nv12Converter> converter_;
+    int outputWidth_ = 0;
+    int outputHeight_ = 0;
     FrameCallback callback_;
     std::atomic<std::uint64_t> sequence_ = 0;
     mutable std::mutex stateMutex_;

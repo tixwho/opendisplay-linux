@@ -157,6 +157,14 @@ opendisplay-linux --transport wifi --host 192.168.1.40 --port 9000
 ```
 
 `--encoder auto` prefers VA-API, then NVENC, and falls back to `libx264`.
+The capture thread converts and scales each PipeWire frame to NV12 with
+libswscale, so FFmpeg reads 12 bits per pixel from the pipe and every encoder
+emits 8-bit 4:2:0 H.264 the iPad hardware decoder accepts. It copies the rows
+out of the dequeued buffer and gives the buffer back before it scales, so the
+compositor keeps a free buffer to capture the next frame into.
+FFmpeg writes packetized NUT to the sender, which reads packet boundaries
+with libavformat and forwards each access unit as Annex B without waiting for
+the next frame.
 Use `Linux/tools/fake_receiver.py` to exercise the TCP framing without an iOS
 device; it does not decode video or advertise Bonjour.
 

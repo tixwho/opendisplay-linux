@@ -8,6 +8,32 @@
 
 namespace od {
 
+std::optional<RgbChunk> rgbChunk(const spa_data& data, const int width, const int height) {
+    const spa_chunk* chunk = data.chunk;
+    if (chunk == nullptr || (chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) != 0) {
+        return std::nullopt;
+    }
+    if ((chunk->flags & SPA_CHUNK_FLAG_EMPTY) != 0) {
+        return NeutralChunk{};
+    }
+    if (data.data == nullptr || data.maxsize == 0 || width <= 0 || height <= 0) {
+        return std::nullopt;
+    }
+    const std::uint32_t offset = chunk->offset % data.maxsize;
+    const std::uint64_t size = std::min<std::uint64_t>(chunk->size, data.maxsize - offset);
+    const auto rowBytes = static_cast<std::uint64_t>(width) * 4;
+    const int stride = chunk->stride > 0 ? chunk->stride : width * 4;
+    if (static_cast<std::uint64_t>(stride) < rowBytes) {
+        return std::nullopt;
+    }
+    const std::uint64_t required =
+        static_cast<std::uint64_t>(stride) * static_cast<std::uint64_t>(height - 1) + rowBytes;
+    if (size < required) {
+        return std::nullopt;
+    }
+    return RgbChunkLayout{.offset = offset, .stride = stride};
+}
+
 const spa_pod* buildPipeWireFormatOffer(spa_pod_builder& builder, const int width,
                                         const int height, const int fps) {
     const auto requestedWidth = static_cast<std::uint32_t>(std::max(1, width));

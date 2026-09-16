@@ -16,6 +16,12 @@
 #include <unistd.h>
 
 namespace od {
+namespace {
+
+/// A receiver that has not drained a frame for this long is gone or unreachable.
+constexpr auto sendTimeout = std::chrono::seconds(2);
+
+}  // namespace
 
 Session::Session(Options options, std::unique_ptr<DesktopBackend> desktop)
     : options_(std::move(options)), desktop_(std::move(desktop)) {
@@ -83,8 +89,6 @@ void Session::startPipeline(const PhoneInfo& phone) {
         encoder_.start(EncoderConfig{
             .kind = options_.encoder,
             .vaapiDevice = options_.vaapiDevice,
-            .outputWidth = outputWidth,
-            .outputHeight = outputHeight,
             .fps = options_.fps,
             .bitrate = options_.bitrate,
         }, [this](EncodedFrame frame) {
@@ -95,9 +99,8 @@ void Session::startPipeline(const PhoneInfo& phone) {
         });
         pipewireFdHandedOff = true;
         capture_.start(capture.pipewireFd, capture.stream.nodeId, capture.captureWidth,
-                       capture.captureHeight, options_.fps, [this](CapturedFrame frame) {
-                           encoder_.submit(std::move(frame));
-                       });
+                       capture.captureHeight, outputWidth, outputHeight, options_.fps,
+                       [this](CapturedFrame frame) { encoder_.submit(std::move(frame)); });
         pipelineRunning_ = true;
         activePhone_ = phone;
         log("Streaming " + std::to_string(outputWidth) + 'x' + std::to_string(outputHeight)
@@ -125,8 +128,10 @@ bool Session::send(const std::string_view payload) {
     if (!connected_.load() || !socket_.valid()) {
         return false;
     }
-    if (!socket_.writeAll(framed)) {
-        connected_.store(false);
+    if (!socket_.writeAll(framed, sendTimeout)) {
+        if (connected_.exchange(false)) {
+            log("Receiver stopped reading; disconnecting");
+        }
         return false;
     }
     return true;
@@ -202,6 +207,10 @@ void Session::receiveLoop() {
 }
 
 bool Session::tick() {
+    if (const auto encoderError = encoder_.failure(); !encoderError.empty()) {
+        stop();
+        throw std::runtime_error("FFmpeg encoder failed: " + encoderError);
+    }
     if (const auto captureError = capture_.error()) {
         throw std::runtime_error("PipeWire capture failed: " + *captureError);
     }
@@ -241,10 +250,13 @@ bool Session::tick() {
         startPipeline(current);
     }
     if (connected_.load() && now - lastPing_ >= std::chrono::seconds(2)) {
-        const QJsonObject ping{{QStringLiteral("type"), QStringLiteral("ping")},
-                               {QStringLiteral("encDrops"), 0},
-                               {QStringLiteral("netDrops"), 0},
-                               {QStringLiteral("pending"), 0}};
+        // Same fields as the Mac sender: totals for drops, the current queue
+        // depth for pending. send() blocks, so nothing is dropped on the network side.
+        const QJsonObject ping{
+            {QStringLiteral("type"), QStringLiteral("ping")},
+            {QStringLiteral("encDrops"), static_cast<qint64>(encoder_.droppedFrames())},
+            {QStringLiteral("netDrops"), 0},
+            {QStringLiteral("pending"), encoder_.pendingFrames()}};
         send(QJsonDocument(ping).toJson(QJsonDocument::Compact).toStdString());
         lastPing_ = now;
     }
@@ -252,16 +264,16 @@ bool Session::tick() {
 }
 
 void Session::stop() {
-    stopPipeline();
+    // Wake blocked reads and writes first, so the encoder and receiver threads can be joined
+    // even when the peer stopped draining. The descriptor stays open until they have.
     connected_.store(false);
-    {
-        std::lock_guard lock(sendMutex_);
-        socket_.close();
-    }
+    socket_.shutdown();
     helloCondition_.notify_all();
+    stopPipeline();
     if (receiver_.joinable()) {
         receiver_.join();
     }
+    socket_.close();
     {
         std::lock_guard lock(stateMutex_);
         phone_.reset();

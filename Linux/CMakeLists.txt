@@ -2,9 +2,27 @@ cmake_minimum_required(VERSION 3.24)
 
 project(opendisplay-linux VERSION 0.1.0 LANGUAGES C CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+# C++23 for std::string::resize_and_overwrite(), which keeps the NV12 packing
+# from zero-filling megabytes it overwrites immediately.
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles([=[
+    #include <string>
+    int main() {
+        std::string value;
+        value.resize_and_overwrite(1, [](char* data, std::size_t) {
+            data[0] = 'x';
+            return std::size_t{1};
+        });
+    }
+]=] OPENDISPLAY_HAS_RESIZE_AND_OVERWRITE)
+if(NOT OPENDISPLAY_HAS_RESIZE_AND_OVERWRITE)
+    message(FATAL_ERROR
+        "OpenDisplay requires a C++23 standard library with std::string::resize_and_overwrite.")
+endif()
 set(CMAKE_AUTOMOC ON)
 
 find_package(Qt6 6.5 REQUIRED COMPONENTS Core DBus Gui)
@@ -16,6 +34,10 @@ pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
 pkg_check_modules(AVAHI REQUIRED IMPORTED_TARGET avahi-client)
 pkg_check_modules(USBMUXD REQUIRED IMPORTED_TARGET libusbmuxd-2.0)
 pkg_check_modules(WAYLAND REQUIRED IMPORTED_TARGET wayland-client)
+# libswscale 8.12.100 and later run sws_scale_frame() on an uninitialized
+# public SwsContext, which the NV12 converter relies on.
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+    libavformat libavcodec libavutil libswscale>=8.12.100)
 find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
 
 set(OPENDISPLAY_BUILD_GUI AUTO CACHE STRING
@@ -52,6 +74,7 @@ set(OPENDISPLAY_CORE_SOURCES
     src/kde_portal.cpp
     src/hyprland_output_controller.cpp
     src/hyprland_portal.cpp
+    src/nv12_converter.cpp
     src/pipewire_capture.cpp
     src/pipewire_format.cpp
     src/session.cpp
@@ -73,6 +96,7 @@ target_link_libraries(opendisplay-core PUBLIC
     PkgConfig::AVAHI
     PkgConfig::USBMUXD
     PkgConfig::WAYLAND
+    PkgConfig::FFMPEG
     Threads::Threads
 )
 
@@ -183,10 +207,21 @@ if(BUILD_TESTING)
         src/wire.cpp
     )
     target_include_directories(opendisplay-encoder-tests PRIVATE include)
-    target_link_libraries(opendisplay-encoder-tests PRIVATE Qt6::Core Threads::Threads)
+    target_link_libraries(opendisplay-encoder-tests PRIVATE
+        Qt6::Core PkgConfig::FFMPEG Threads::Threads)
     target_compile_options(opendisplay-encoder-tests PRIVATE -UNDEBUG)
     add_test(NAME encoder COMMAND opendisplay-encoder-tests)
     set_tests_properties(encoder PROPERTIES TIMEOUT 15)
+
+    add_executable(opendisplay-nv12-converter-tests
+        tests/nv12_converter_tests.cpp
+        src/nv12_converter.cpp
+    )
+    target_include_directories(opendisplay-nv12-converter-tests PRIVATE include)
+    target_link_libraries(opendisplay-nv12-converter-tests PRIVATE PkgConfig::FFMPEG)
+    target_compile_options(opendisplay-nv12-converter-tests PRIVATE -UNDEBUG)
+    add_test(NAME nv12-converter COMMAND opendisplay-nv12-converter-tests)
+    set_tests_properties(nv12-converter PROPERTIES TIMEOUT 30)
 
     add_executable(opendisplay-pipewire-format-tests
         tests/pipewire_format_tests.cpp

@@ -62,14 +62,14 @@ struct Endpoint {
     int usbHandle = -1;
 };
 
+/// Captured frames are NV12 at the encoder output size: the capture thread
+/// converts and scales straight out of the PipeWire buffer, so the encoder
+/// receives 12 bits per pixel instead of 32 and needs no scale filter.
 struct VideoFormat {
-    enum class PixelFormat { Bgra, Bgrx, Rgba, Rgbx };
-
     int width = 0;
     int height = 0;
-    int stride = 0;
+    int stride = 0;  ///< luma stride; the interleaved chroma plane uses the same stride
     int fps = 60;
-    PixelFormat pixelFormat = PixelFormat::Bgra;
 };
 
 struct CapturedFrame {

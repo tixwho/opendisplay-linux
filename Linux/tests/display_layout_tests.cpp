@@ -114,6 +114,22 @@ void supportsEveryPlacementAxis() {
     assert(left.logicalGeometry.y == 80);
 }
 
+void centersAboveAndBelowReference() {
+    od::DisplayOptions options;
+    options.virtualResolution = od::Size{.width = 1000, .height = 800};
+    options.virtualScale = 1.0;
+    options.alignTo = od::AlignDirection::Center;
+    options.referenceGeometry = od::Rect{.x = 20, .y = 30, .width = 1600, .height = 900};
+    options.extendTo = od::ExtendDirection::Top;
+    const auto top = od::planDisplayLayout(monitor("1", "eDP-1"), ipad(), options, 60);
+    assert(top.logicalGeometry.x == 320);
+    assert(top.logicalGeometry.y == -770);
+    options.extendTo = od::ExtendDirection::Bottom;
+    const auto bottom = od::planDisplayLayout(monitor("1", "eDP-1"), ipad(), options, 60);
+    assert(bottom.logicalGeometry.x == 320);
+    assert(bottom.logicalGeometry.y == 930);
+}
+
 void derivesScaleFromPhysicalDensity() {
     auto reference = monitor("1", "eDP-1");
     reference.resolution = {.width = 3840, .height = 2160};
@@ -137,5 +153,6 @@ int main() {
     makesKdeCustomModesCvtCompatible();
     keepsHyprlandNativeModeWhenLogicalSizeIsIntegral();
     supportsEveryPlacementAxis();
+    centersAboveAndBelowReference();
     derivesScaleFromPhysicalDensity();
 }

@@ -78,7 +78,7 @@ void validateAlignment(const ExtendDirection extendTo, const AlignDirection alig
         || extendTo == ExtendDirection::Right;
     const bool verticalAlignment = alignTo == AlignDirection::Top
         || alignTo == AlignDirection::Bottom || alignTo == AlignDirection::Center;
-    if (horizontalExtension != verticalAlignment) {
+    if (alignTo != AlignDirection::Center && horizontalExtension != verticalAlignment) {
         throw std::runtime_error(
             "--align-to must be top, bottom, or center for left/right extension, and "
             "left, right, or center for top/bottom extension");
