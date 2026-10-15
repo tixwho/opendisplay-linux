@@ -20,7 +20,7 @@ struct EncoderConfig {
     std::string vaapiDevice = "/dev/dri/renderD128";
     int outputWidth = 0;
     int outputHeight = 0;
-    int fps = 60;
+    int fps = 30;
     int bitrate = 18'000'000;
 };
 

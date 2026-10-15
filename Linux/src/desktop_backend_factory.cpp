@@ -4,6 +4,7 @@
 
 #ifndef OD_DESKTOP_FACTORY_TEST_ONLY
 #include "opendisplay/hyprland_portal.hpp"
+#include "opendisplay/gnome_backend.hpp"
 #include "opendisplay/kde_portal.hpp"
 #endif
 
@@ -28,6 +29,9 @@ CompositorKind detectCompositor(const CompositorKind requested,
     if (!hyprlandSignature.empty() || desktop.find("hyprland") != std::string::npos) {
         return CompositorKind::Hyprland;
     }
+    if (desktop.find("gnome") != std::string::npos) {
+        return CompositorKind::Gnome;
+    }
     if (!kdeSession.empty() || desktop.find("kde") != std::string::npos
         || desktop.find("plasma") != std::string::npos) {
         return CompositorKind::Kde;
@@ -49,6 +53,10 @@ std::unique_ptr<DesktopBackend> makeDesktopBackend(const CompositorKind requeste
     if (selected == CompositorKind::Hyprland) {
         debug("Desktop backend: Hyprland");
         return std::make_unique<HyprlandPortal>();
+    }
+    if (selected == CompositorKind::Gnome) {
+        debug("Desktop backend: GNOME Mutter");
+        return std::make_unique<GnomeBackend>();
     }
     debug("Desktop backend: KDE");
     return std::make_unique<KdePortal>();

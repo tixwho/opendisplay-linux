@@ -22,6 +22,9 @@ std::optional<QJsonObject> parseJson(std::string_view payload);
 std::optional<PhoneInfo> parseHello(const QJsonObject& object);
 std::string welcome();
 std::string pong(double phoneTime, double hostTime);
+std::string cursor(double x, double y, bool visible);
+std::string cursorImage(double width, double height, double anchorX, double anchorY,
+                        std::string_view pngBase64);
 std::string videoPayload(const EncodedFrame& frame, std::int64_t sentAtMs);
 bool containsAnnexBStartCode(std::string_view bytes);
 

@@ -1,10 +1,45 @@
 # OpenDisplay for Linux
 
-This target connects the existing, unmodified iOS/iPadOS receiver to a KDE or
-Hyprland Wayland session. It discovers `_opensidecar._tcp` services with Avahi
+This target connects the existing, unmodified iOS/iPadOS receiver to a GNOME,
+KDE, or Hyprland Wayland session. It discovers `_opensidecar._tcp` services with Avahi
 or opens the receiver's port through usbmuxd, captures with PipeWire, and
 streams Annex B H.264 produced by FFmpeg. The command-line client and an
 initial Kirigami control application share the same connection engine.
+
+## Ubuntu dependencies
+
+On Ubuntu 26.04 with GNOME Wayland, install the compiler and desktop/runtime
+dependencies, then build the native package:
+
+```sh
+sudo apt install build-essential cmake pkg-config qt6-base-dev qt6-declarative-dev \
+  qt6-wayland-dev libkscreen-dev libkirigami-dev libpipewire-0.3-dev \
+  libavahi-client-dev libusbmuxd-dev libimobiledevice-glue-dev \
+  libwayland-dev wayland-protocols \
+  ffmpeg libavcodec-extra pipewire avahi-daemon usbmuxd
+cmake -S Linux -B build/linux -DCMAKE_BUILD_TYPE=Release -DOPENDISPLAY_BUILD_GUI=ON
+cmake --build build/linux -j
+cpack --config build/linux/CPackConfig.cmake -G DEB
+sudo apt install ./build/linux/opendisplay-linux_*.deb
+```
+
+The package installs the GUI and CLI. It does not change system services or
+portal configuration. Ensure the user session has PipeWire running and pair
+the iPad with usbmuxd once; then launch OpenDisplay from the app grid and
+choose USB (or leave transport on Automatic).
+
+GNOME virtual outputs use Mutter's `org.gnome.Mutter.ScreenCast.RecordVirtual`
+session API, which GNOME documents in its D-Bus interface source as private
+and without cross-version compatibility guarantees. Mutter presents its native
+remote-access authorization UI, creates the monitor, and removes it when the
+session closes. The virtual mode uses the requested iPad resolution, refresh
+rate, and display scale; Mutter places it in the desktop layout. The API is
+separate from the XDG ScreenCast portal, which does not provide virtual-output
+creation.
+
+The iPad USB and GNOME capture path must be validated on the target computer;
+building this package alone does not establish hardware performance or AMD
+VA-API support. `--encoder auto` tries VA-API first and falls back to software.
 
 ## Arch Linux dependencies
 
@@ -84,8 +119,8 @@ window exits instead of leaving an invisible background process. On Hyprland,
 a StatusNotifier-capable bar such as Waybar enables tray behavior.
 
 The compositor backend is detected automatically; override it with
-`--compositor kde` or `--compositor hyprland`. The first run displays the
-desktop's capture permission dialog. Other useful forms are:
+`--compositor gnome`, `--compositor kde`, or `--compositor hyprland`. GNOME
+uses Mutter's native authorization prompt. Other useful forms are:
 
 ```sh
 ./build/linux/opendisplay-linux --list
@@ -162,7 +197,10 @@ device; it does not decode video or advertise Bonjour.
 
 ## Current MVP limits
 
-KDE Plasma Wayland and Hyprland are supported. Hyprland's portal picker cannot
+KDE Plasma Wayland, Hyprland, and GNOME Wayland are supported. GNOME's virtual
+output is positioned by Mutter; custom reference-monitor placement is not
+currently exposed by its backend. Mirror capture uses the standard screen-sharing
+portal. Hyprland's portal picker cannot
 yet be preselected by output name, so the requested monitor must be chosen in
 the dialog. Audio,
 clipboard, cursor sprites, encryption, reconnection, and multi-device sessions

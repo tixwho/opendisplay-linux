@@ -20,6 +20,7 @@ struct PortalCapture {
     int pipewireFd = -1;
     int captureWidth = 0;
     int captureHeight = 0;
+    bool cursorMetadata = false;
 };
 
 struct DesktopRequest {

@@ -34,5 +34,18 @@ int main() {
     const auto video = od::wire::videoPayload(encoded, 120);
     assert(video.starts_with("{\"cap\":100,\"snd\":120}"));
     assert(video.ends_with(encoded.annexB));
+
+    const auto cursor = od::wire::parseJson(od::wire::cursor(0.25, 0.75, true));
+    assert(cursor && cursor->value("type").toString() == "cursor");
+    assert(cursor->value("x").toDouble() == 0.25);
+    assert(cursor->value("y").toDouble() == 0.75);
+    assert(cursor->value("v").toInt() == 1);
+
+    const auto cursorImage = od::wire::parseJson(
+        od::wire::cursorImage(0.02, 0.03, 0.1, 0.2, "aGVsbG8="));
+    assert(cursorImage && cursorImage->value("type").toString() == "cursorImg");
+    assert(cursorImage->value("png").toString() == "aGVsbG8=");
+    assert(cursorImage->value("nw").toDouble() == 0.02);
+    assert(cursorImage->value("ax").toDouble() == 0.1);
     return 0;
 }

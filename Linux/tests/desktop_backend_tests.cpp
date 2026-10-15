@@ -15,6 +15,8 @@ void detectsDesktopWithoutChangingLegacyFallback() {
            == CompositorKind::Hyprland);
     assert(od::detectCompositor(CompositorKind::Auto, "KDE", "", "true")
            == CompositorKind::Kde);
+    assert(od::detectCompositor(CompositorKind::Auto, "ubuntu:GNOME", "", "")
+           == CompositorKind::Gnome);
     assert(od::detectCompositor(CompositorKind::Auto, "unknown", "", "")
            == CompositorKind::Kde);
     assert(od::detectCompositor(CompositorKind::Kde, "Hyprland", "instance", "")

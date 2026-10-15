@@ -2,6 +2,21 @@ cmake_minimum_required(VERSION 3.24)
 
 project(opendisplay-linux VERSION 0.1.0 LANGUAGES C CXX)
 
+set(CPACK_GENERATOR DEB)
+set(CPACK_PACKAGE_NAME opendisplay-linux)
+set(CPACK_PACKAGE_DIRECTORY "${CMAKE_BINARY_DIR}")
+set(CPACK_PACKAGE_VENDOR "OpenDisplay contributors")
+set(CPACK_PACKAGE_CONTACT "OpenDisplay contributors")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "Use an iPad as a Linux extended display over USB or Wi-Fi")
+set(CPACK_DEBIAN_PACKAGE_MAINTAINER "OpenDisplay contributors")
+set(CPACK_DEBIAN_PACKAGE_SECTION net)
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+set(CPACK_DEBIAN_PACKAGE_DEPENDS "ffmpeg, libavcodec-extra, pipewire, avahi-daemon, usbmuxd, xdg-desktop-portal, xdg-desktop-portal-gnome, qml6-module-org-kde-kirigami, qml6-module-qtquick-controls, qml6-module-qtquick-layouts")
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+set(CPACK_PACKAGING_INSTALL_PREFIX /usr)
+include(CPack)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -41,6 +56,7 @@ add_custom_command(
 set(OPENDISPLAY_CORE_SOURCES
     include/opendisplay/kde_portal.hpp
     include/opendisplay/hyprland_portal.hpp
+    include/opendisplay/gnome_backend.hpp
     include/opendisplay/xdg_portal.hpp
     ${VIRTUAL_POINTER_HEADER}
     ${VIRTUAL_POINTER_CODE}
@@ -52,6 +68,7 @@ set(OPENDISPLAY_CORE_SOURCES
     src/kde_portal.cpp
     src/hyprland_output_controller.cpp
     src/hyprland_portal.cpp
+    src/gnome_backend.cpp
     src/pipewire_capture.cpp
     src/pipewire_format.cpp
     src/session.cpp

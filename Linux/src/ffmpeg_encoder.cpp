@@ -180,25 +180,44 @@ std::vector<std::string> FfmpegEncoder::arguments(const VideoFormat& input) cons
         "-video_size", size, "-framerate", rate, "-i", "pipe:0", "-an",
     });
 
-    const std::string scale = "scale=" + std::to_string(outputWidth) + ':'
-        + std::to_string(outputHeight) + ":flags=fast_bilinear";
+    const std::string scale = outputWidth == input.width && outputHeight == input.height
+        ? std::string{}
+        : "scale=" + std::to_string(outputWidth) + ':' + std::to_string(outputHeight)
+            + ":flags=fast_bilinear";
     if (selected_ == EncoderKind::Vaapi) {
-        args.insert(args.end(), {"-vf", scale + ",format=nv12,hwupload", "-c:v", "h264_vaapi"});
+        // Many Mesa VA-API drivers (including Intel iHD and AMD radeonsi) only
+        // expose CQP. Passing -b:v makes FFmpeg infer VBR and the encoder then
+        // exits before producing a frame. Use a predictable quality target
+        // supported by the common CQP-only path instead.
+        const auto filter = (scale.empty() ? std::string{} : scale + ',')
+            + "format=nv12,hwupload";
+        // Keep the VA-API queue to one frame. FFmpeg defaults to two frames
+        // of parallelism, which adds visible latency for an interactive display.
+        args.insert(args.end(), {"-vf", filter, "-c:v", "h264_vaapi", "-async_depth", "1",
+                                 "-rc_mode", "CQP", "-qp", "23"});
     } else if (selected_ == EncoderKind::Nvenc) {
-        args.insert(args.end(), {"-vf", scale, "-c:v", "h264_nvenc", "-preset", "p1",
+        args.insert(args.end(), {"-c:v", "h264_nvenc", "-preset", "p1",
                                  "-tune", "ull", "-delay", "0"});
+        if (!scale.empty()) {
+            args.insert(args.end(), {"-vf", scale});
+        }
     } else {
-        args.insert(args.end(), {"-vf", scale, "-c:v", "libx264", "-preset", "ultrafast",
+        args.insert(args.end(), {"-c:v", "libx264", "-preset", "ultrafast",
                                  "-tune", "zerolatency",
                                  "-x264-params", "repeat-headers=1:aud=1"});
+        if (!scale.empty()) {
+            args.insert(args.end(), {"-vf", scale});
+        }
     }
-    args.insert(args.end(), {
-        "-bf", "0", "-g", std::to_string(std::max(config_.fps * 60, config_.fps)),
-        "-b:v", std::to_string(config_.bitrate), "-maxrate", std::to_string(config_.bitrate),
-        "-bufsize", std::to_string(std::max(config_.bitrate / 2, 1)),
-        "-bsf:v", "h264_metadata=aud=insert,dump_extra=freq=keyframe",
-        "-f", "h264", "pipe:1",
-    });
+    args.insert(args.end(), {"-bf", "0", "-g",
+                             std::to_string(std::max(config_.fps * 60, config_.fps))});
+    if (selected_ != EncoderKind::Vaapi) {
+        args.insert(args.end(), {"-b:v", std::to_string(config_.bitrate), "-maxrate",
+                                 std::to_string(config_.bitrate), "-bufsize",
+                                 std::to_string(std::max(config_.bitrate / 2, 1))});
+    }
+    args.insert(args.end(), {"-bsf:v", "h264_metadata=aud=insert,dump_extra=freq=keyframe",
+                             "-f", "h264", "pipe:1"});
     return args;
 }
 
@@ -292,8 +311,13 @@ void FfmpegEncoder::run() {
                 timestamps_.push_back(frame.capturedAtMs);
             }
             if (!writeAll(inputFd_, frame.bytes)) {
-                log("FFmpeg stopped accepting frames; restarting it");
+                log("FFmpeg stopped accepting frames");
                 stopProcess();
+                if (config_.kind == EncoderKind::Auto
+                    && selected_ == EncoderKind::Vaapi) {
+                    selected_ = EncoderKind::Software;
+                    log("VA-API failed at runtime; falling back to libx264");
+                }
                 startProcess(frame.format);
                 {
                     std::lock_guard lock(mutex_);

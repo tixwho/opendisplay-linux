@@ -199,7 +199,8 @@ Kirigami.ApplicationWindow {
                     model: [
                         { "text": qsTr("Automatic"), "value": "auto" },
                         { "text": qsTr("KDE Plasma"), "value": "kde" },
-                        { "text": qsTr("Hyprland"), "value": "hyprland" }
+                        { "text": qsTr("Hyprland"), "value": "hyprland" },
+                        { "text": qsTr("GNOME Wayland"), "value": "gnome" }
                     ]
                     Component.onCompleted: root.selectSaved(this, "compositor", "auto")
                 }
@@ -291,7 +292,7 @@ Kirigami.ApplicationWindow {
                     Kirigami.FormData.label: qsTr("Frame rate:")
                     from: 1
                     to: 240
-                    value: root.saved("fps", 60)
+                    value: root.saved("fps", 30)
                 }
 
                 Controls.SpinBox {

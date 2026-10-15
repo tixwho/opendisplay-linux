@@ -3,13 +3,14 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace od {
 
 enum class TransportKind { Auto, Wifi, Usb };
 enum class CaptureMode { Extend, Mirror };
 enum class EncoderKind { Auto, Vaapi, Nvenc, Software };
-enum class CompositorKind { Auto, Kde, Hyprland };
+enum class CompositorKind { Auto, Kde, Hyprland, Gnome };
 enum class ExtendDirection { Left, Right, Top, Bottom };
 enum class AlignDirection { Left, Right, Top, Bottom, Center };
 
@@ -68,7 +69,7 @@ struct VideoFormat {
     int width = 0;
     int height = 0;
     int stride = 0;
-    int fps = 60;
+    int fps = 30;
     PixelFormat pixelFormat = PixelFormat::Bgra;
 };
 
@@ -77,6 +78,23 @@ struct CapturedFrame {
     std::int64_t capturedAtMs = 0;
     std::uint64_t sequence = 0;
     std::string bytes;
+};
+
+struct CursorBitmap {
+    int width = 0;
+    int height = 0;
+    int stride = 0;
+    int hotspotX = 0;
+    int hotspotY = 0;
+    VideoFormat::PixelFormat pixelFormat = VideoFormat::PixelFormat::Bgra;
+    std::vector<std::uint8_t> bytes;
+};
+
+struct CursorUpdate {
+    int x = 0;
+    int y = 0;
+    bool visible = false;
+    std::optional<CursorBitmap> bitmap;
 };
 
 struct EncodedFrame {
@@ -95,7 +113,7 @@ struct Options {
     std::string serviceName;
     std::string udid;
     std::string vaapiDevice = "/dev/dri/renderD128";
-    int fps = 60;
+    int fps = 30;
     int bitrate = 18'000'000;
     double scale = 1.0;
     DisplayOptions display;

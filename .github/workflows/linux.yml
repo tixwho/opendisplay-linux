@@ -1,0 +1,48 @@
+name: Linux build
+
+on:
+  pull_request:
+    paths:
+      - "Linux/**"
+      - ".github/workflows/linux.yml"
+  push:
+    branches:
+      - linux-port
+      - feat/gnome-wayland-support
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential cmake dpkg-dev pkg-config \
+            qt6-base-dev qt6-declarative-dev qt6-wayland-dev \
+            libkscreen-dev libkirigami-dev libpipewire-0.3-dev \
+            libavahi-client-dev libusbmuxd-dev libimobiledevice-glue-dev \
+            libwayland-dev ffmpeg libavcodec-extra \
+            wayland-protocols
+      - name: Configure
+        run: >-
+          cmake -S Linux -B build/linux
+          -DCMAKE_BUILD_TYPE=Release
+          -DOPENDISPLAY_BUILD_GUI=ON
+          -DBUILD_TESTING=ON
+      - name: Build
+        run: cmake --build build/linux --parallel
+      - name: Test
+        run: ctest --test-dir build/linux --output-on-failure
+      - name: Package DEB
+        run: cpack --config build/linux/CPackConfig.cmake -G DEB
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opendisplay-linux-ubuntu-26.04
+          path: build/linux/opendisplay-linux_*.deb
+          if-no-files-found: error
+          retention-days: 14

@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 
 namespace od {
 
@@ -45,6 +46,8 @@ private:
     void stopPipeline();
     bool send(std::string_view payload);
     void queue(Event event);
+    void queueCursor(CursorUpdate update);
+    void sendCursorUpdate(const CursorUpdate& update);
 
     Options options_;
     Socket socket_;
@@ -59,6 +62,13 @@ private:
     std::optional<PhoneInfo> phone_;
     std::optional<PhoneInfo> activePhone_;
     std::deque<Event> events_;
+    std::optional<CursorUpdate> pendingCursor_;
+    std::optional<CursorBitmap> cursorBitmap_;
+    bool cursorBitmapDirty_ = false;
+    std::optional<std::pair<int, int>> lastCursorPosition_;
+    bool cursorVisible_ = false;
+    int captureWidth_ = 0;
+    int captureHeight_ = 0;
     std::chrono::steady_clock::time_point lastPing_{};
     std::chrono::steady_clock::time_point reconfigureAfter_{};
     bool pipelineRunning_ = false;

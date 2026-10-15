@@ -4,6 +4,8 @@
 #include "opendisplay/pipewire_format.hpp"
 
 #include <spa/param/format-utils.h>
+#include <spa/param/param.h>
+#include <spa/buffer/meta.h>
 #include <spa/param/video/raw.h>
 #include <spa/utils/result.h>
 
@@ -18,6 +20,8 @@
 
 namespace od {
 namespace {
+
+constexpr int maxCursorBitmapDimension = 384;
 
 const pw_stream_events streamEvents = [] {
     pw_stream_events events{};
@@ -38,6 +42,11 @@ std::optional<VideoFormat::PixelFormat> pixelFormat(const spa_video_format forma
     }
 }
 
+int cursorMetaSize(const int width, const int height) {
+    return static_cast<int>(sizeof(spa_meta_cursor) + sizeof(spa_meta_bitmap))
+        + width * height * 4;
+}
+
 const char* pixelFormatName(const spa_video_format format) {
     switch (format) {
     case SPA_VIDEO_FORMAT_BGRA: return "BGRA";
@@ -53,7 +62,8 @@ const char* pixelFormatName(const spa_video_format format) {
 PipeWireCapture::~PipeWireCapture() { stop(); }
 
 void PipeWireCapture::start(const int remoteFd, const std::uint32_t nodeId, const int width,
-                            const int height, const int fps, FrameCallback callback) {
+                            const int height, const int fps, FrameCallback callback,
+                            const bool cursorMetadata, CursorCallback cursorCallback) {
     stop();
     {
         std::lock_guard lock(stateMutex_);
@@ -64,6 +74,13 @@ void PipeWireCapture::start(const int remoteFd, const std::uint32_t nodeId, cons
     std::call_once(initialized, [] { pw_init(nullptr, nullptr); });
 
     callback_ = std::move(callback);
+    cursorCallback_ = std::move(cursorCallback);
+    cursorMetadataEnabled_ = cursorMetadata;
+    cursorMetadataRequested_ = false;
+    cursorMetadataSeen_ = false;
+    bufferStorageLogged_ = false;
+    captureWidth_ = width;
+    captureHeight_ = height;
     loop_ = pw_thread_loop_new("opendisplay-capture", nullptr);
     if (loop_ == nullptr) {
         ::close(remoteFd);
@@ -75,11 +92,12 @@ void PipeWireCapture::start(const int remoteFd, const std::uint32_t nodeId, cons
         stop();
         throw std::runtime_error("cannot create PipeWire context");
     }
-    core_ = pw_context_connect_fd(context_, remoteFd, nullptr, 0);
+    core_ = remoteFd >= 0 ? pw_context_connect_fd(context_, remoteFd, nullptr, 0)
+                          : pw_context_connect(context_, nullptr, 0);
     if (core_ == nullptr) {
-        ::close(remoteFd);
+        if (remoteFd >= 0) ::close(remoteFd);
         stop();
-        throw std::runtime_error("cannot connect to the portal PipeWire remote");
+        throw std::runtime_error("cannot connect to the PipeWire server");
     }
 
     auto* properties = pw_properties_new(
@@ -151,6 +169,13 @@ void PipeWireCapture::stop() {
         loop_ = nullptr;
     }
     callback_ = {};
+    cursorCallback_ = {};
+    cursorMetadataRequested_ = false;
+    cursorMetadataEnabled_ = false;
+    cursorMetadataSeen_ = false;
+    bufferStorageLogged_ = false;
+    captureWidth_ = 0;
+    captureHeight_ = 0;
     format_ = {};
 }
 
@@ -205,6 +230,28 @@ void PipeWireCapture::parameterChanged(void* data, const std::uint32_t id,
         + pixelFormatName(self.format_.format) + " @ "
         + std::to_string(self.format_.framerate.num) + "/"
         + std::to_string(self.format_.framerate.denom) + " fps");
+    if (self.cursorMetadataEnabled_ && !self.cursorMetadataRequested_) {
+        self.requestCursorMetadata();
+    }
+}
+
+void PipeWireCapture::requestCursorMetadata() {
+    std::uint8_t storage[128]{};
+    spa_pod_builder builder = SPA_POD_BUILDER_INIT(storage, sizeof(storage));
+    const spa_pod* parameters[1];
+    parameters[0] = static_cast<const spa_pod*>(spa_pod_builder_add_object(
+        &builder, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+        SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Cursor),
+        SPA_PARAM_META_size, SPA_POD_CHOICE_RANGE_Int(
+            cursorMetaSize(64, 64), cursorMetaSize(1, 1),
+            cursorMetaSize(maxCursorBitmapDimension, maxCursorBitmapDimension))));
+    const int result = pw_stream_update_params(stream_, parameters, 1);
+    if (result < 0) {
+        debug(std::string("PipeWire cursor metadata request failed: ") + spa_strerror(result));
+        return;
+    }
+    cursorMetadataRequested_ = true;
+    debug("Requested PipeWire cursor metadata");
 }
 
 void PipeWireCapture::process(void* data) {
@@ -225,6 +272,19 @@ void PipeWireCapture::handleProcess() {
 
     const auto& data = buffer->datas[0];
     const auto* chunk = data.chunk;
+    if (!bufferStorageLogged_) {
+        const char* storage = "unknown";
+        switch (data.type) {
+        case SPA_DATA_MemPtr: storage = "MemPtr"; break;
+        case SPA_DATA_MemFd: storage = "MemFd"; break;
+        case SPA_DATA_DmaBuf: storage = "DmaBuf"; break;
+        case SPA_DATA_MemId: storage = "MemId"; break;
+        default: break;
+        }
+        debug(std::string("PipeWire buffer storage: ") + storage + ", stride "
+              + std::to_string(chunk->stride) + ", flags " + std::to_string(data.flags));
+        bufferStorageLogged_ = true;
+    }
     const auto width = static_cast<int>(format_.size.width);
     const auto height = static_cast<int>(format_.size.height);
     const int sourceStride = chunk->stride > 0 ? chunk->stride : width * 4;
@@ -237,6 +297,59 @@ void PipeWireCapture::handleProcess() {
         return;
     }
     const auto* source = static_cast<const char*>(data.data) + chunk->offset;
+
+    if (cursorMetadataEnabled_ && cursorCallback_) {
+        auto* cursor = static_cast<spa_meta_cursor*>(spa_buffer_find_meta_data(
+            buffer, SPA_META_Cursor, sizeof(spa_meta_cursor)));
+        if (cursor != nullptr) {
+            if (!cursorMetadataSeen_) {
+                log("PipeWire cursor metadata is available");
+                cursorMetadataSeen_ = true;
+            }
+            CursorUpdate update;
+            update.x = cursor->position.x;
+            update.y = cursor->position.y;
+            update.visible = cursor->id != 0 && update.x >= 0 && update.y >= 0
+                && update.x < captureWidth_ && update.y < captureHeight_;
+
+            if (cursor->id != 0 && cursor->bitmap_offset >= sizeof(spa_meta_cursor)) {
+                auto* bitmap = SPA_PTROFF(cursor, cursor->bitmap_offset, spa_meta_bitmap);
+                const auto bitmapFormat = pixelFormat(
+                    static_cast<spa_video_format>(bitmap->format));
+                const int cursorWidth = static_cast<int>(bitmap->size.width);
+                const int cursorHeight = static_cast<int>(bitmap->size.height);
+                if (bitmapFormat && cursorWidth > 0 && cursorHeight > 0
+                    && cursorWidth <= maxCursorBitmapDimension
+                    && cursorHeight <= maxCursorBitmapDimension
+                    && bitmap->stride >= cursorWidth * 4
+                    && bitmap->offset >= sizeof(spa_meta_bitmap)
+                    && static_cast<std::size_t>(cursor->bitmap_offset)
+                        + static_cast<std::size_t>(bitmap->offset)
+                        + static_cast<std::size_t>(bitmap->stride) * cursorHeight
+                        <= static_cast<std::size_t>(cursorMetaSize(
+                            maxCursorBitmapDimension, maxCursorBitmapDimension))) {
+                    const auto* pixels = SPA_PTROFF(bitmap, bitmap->offset, std::uint8_t);
+                    const auto rowBytes = static_cast<std::size_t>(cursorWidth) * 4;
+                    const auto stride = static_cast<std::size_t>(bitmap->stride);
+                    CursorBitmap sprite{
+                        .width = cursorWidth,
+                        .height = cursorHeight,
+                        .stride = static_cast<int>(rowBytes),
+                        .hotspotX = cursor->hotspot.x,
+                        .hotspotY = cursor->hotspot.y,
+                        .pixelFormat = *bitmapFormat,
+                        .bytes = std::vector<std::uint8_t>(rowBytes * cursorHeight),
+                    };
+                    for (int row = 0; row < cursorHeight; ++row) {
+                        std::memcpy(sprite.bytes.data() + static_cast<std::size_t>(row) * rowBytes,
+                                    pixels + static_cast<std::size_t>(row) * stride, rowBytes);
+                    }
+                    update.bitmap = std::move(sprite);
+                }
+            }
+            cursorCallback_(std::move(update));
+        }
+    }
 
     CapturedFrame frame;
     frame.format = VideoFormat{
@@ -251,10 +364,17 @@ void PipeWireCapture::handleProcess() {
     frame.capturedAtMs = wallClockMs();
     frame.sequence = sequence_.fetch_add(1);
     frame.bytes.resize(static_cast<std::size_t>(targetStride * height));
-    for (int row = 0; row < height; ++row) {
-        std::memcpy(frame.bytes.data() + static_cast<std::size_t>(row * targetStride),
-                    source + static_cast<std::size_t>(row * sourceStride),
-                    static_cast<std::size_t>(targetStride));
+    if (sourceStride == targetStride) {
+        // Mutter's tightly packed frames are contiguous. One bulk copy avoids
+        // thousands of small memcpy calls on every high-resolution frame.
+        std::memcpy(frame.bytes.data(), source,
+                    static_cast<std::size_t>(targetStride) * height);
+    } else {
+        for (int row = 0; row < height; ++row) {
+            std::memcpy(frame.bytes.data() + static_cast<std::size_t>(row) * targetStride,
+                        source + static_cast<std::size_t>(row) * sourceStride,
+                        static_cast<std::size_t>(targetStride));
+        }
     }
     pw_stream_queue_buffer(stream_, pipewireBuffer);
     if (callback_) {

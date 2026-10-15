@@ -5,6 +5,8 @@
 
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QBuffer>
+#include <QImage>
 
 #include <algorithm>
 #include <array>
@@ -67,10 +69,6 @@ void Session::start(const Endpoint& endpoint) {
 void Session::startPipeline(const PhoneInfo& phone) {
     const int nativeWidth = std::max(2, phone.pixelsWide) & ~1;
     const int nativeHeight = std::max(2, phone.pixelsHigh) & ~1;
-    const int outputWidth = std::max(2, static_cast<int>(std::lround(nativeWidth * options_.scale)))
-        & ~1;
-    const int outputHeight = std::max(2, static_cast<int>(std::lround(nativeHeight * options_.scale)))
-        & ~1;
     const auto capture = desktop_->start(DesktopRequest{
         .mode = options_.mode,
         .receiver = phone,
@@ -78,6 +76,15 @@ void Session::startPipeline(const PhoneInfo& phone) {
         .refreshRate = options_.fps,
         .requestInput = options_.input,
     });
+    // Do not upscale a deliberately smaller virtual mode back to the iPad's
+    // native size. That adds CPU work without restoring detail, and makes the
+    // GUI's Virtual resolution control ineffective as a performance setting.
+    const int outputWidth = std::min(
+        std::max(2, static_cast<int>(std::lround(nativeWidth * options_.scale)) & ~1),
+        std::max(2, capture.captureWidth & ~1));
+    const int outputHeight = std::min(
+        std::max(2, static_cast<int>(std::lround(nativeHeight * options_.scale)) & ~1),
+        std::max(2, capture.captureHeight & ~1));
     bool pipewireFdHandedOff = false;
     try {
         encoder_.start(EncoderConfig{
@@ -94,16 +101,19 @@ void Session::startPipeline(const PhoneInfo& phone) {
             send(wire::videoPayload(frame, wallClockMs()));
         });
         pipewireFdHandedOff = true;
+        captureWidth_ = capture.captureWidth;
+        captureHeight_ = capture.captureHeight;
         capture_.start(capture.pipewireFd, capture.stream.nodeId, capture.captureWidth,
                        capture.captureHeight, options_.fps, [this](CapturedFrame frame) {
                            encoder_.submit(std::move(frame));
-                       });
+                       }, capture.cursorMetadata,
+                       [this](CursorUpdate update) { queueCursor(std::move(update)); });
         pipelineRunning_ = true;
         activePhone_ = phone;
         log("Streaming " + std::to_string(outputWidth) + 'x' + std::to_string(outputHeight)
             + " at up to " + std::to_string(options_.fps) + " fps");
     } catch (...) {
-        if (!pipewireFdHandedOff) {
+        if (!pipewireFdHandedOff && capture.pipewireFd >= 0) {
             ::close(capture.pipewireFd);
         }
         encoder_.stop();
@@ -116,6 +126,8 @@ void Session::stopPipeline() {
     capture_.stop();
     encoder_.stop();
     desktop_->stop();
+    captureWidth_ = 0;
+    captureHeight_ = 0;
     pipelineRunning_ = false;
 }
 
@@ -135,6 +147,74 @@ bool Session::send(const std::string_view payload) {
 void Session::queue(Event event) {
     std::lock_guard lock(stateMutex_);
     events_.push_back(std::move(event));
+}
+
+void Session::queueCursor(CursorUpdate update) {
+    std::lock_guard lock(stateMutex_);
+    if (update.bitmap) {
+        cursorBitmap_ = std::move(update.bitmap);
+        cursorBitmapDirty_ = true;
+    }
+    update.bitmap.reset();
+    pendingCursor_ = std::move(update);
+}
+
+void Session::sendCursorUpdate(const CursorUpdate& update) {
+    if (update.bitmap) {
+        const auto& bitmap = *update.bitmap;
+        QImage image(bitmap.width, bitmap.height, QImage::Format_RGBA8888);
+        if (!image.isNull() && bitmap.stride >= bitmap.width * 4
+            && bitmap.bytes.size() >= static_cast<std::size_t>(bitmap.stride) * bitmap.height) {
+            for (int y = 0; y < bitmap.height; ++y) {
+                const auto* source = bitmap.bytes.data()
+                    + static_cast<std::size_t>(y) * bitmap.stride;
+                auto* target = image.scanLine(y);
+                for (int x = 0; x < bitmap.width; ++x) {
+                    const auto* pixel = source + x * 4;
+                    auto* rgba = target + x * 4;
+                    switch (bitmap.pixelFormat) {
+                    case VideoFormat::PixelFormat::Bgra:
+                        rgba[0] = pixel[2]; rgba[1] = pixel[1];
+                        rgba[2] = pixel[0]; rgba[3] = pixel[3];
+                        break;
+                    case VideoFormat::PixelFormat::Bgrx:
+                        rgba[0] = pixel[2]; rgba[1] = pixel[1];
+                        rgba[2] = pixel[0]; rgba[3] = 255;
+                        break;
+                    case VideoFormat::PixelFormat::Rgba:
+                        std::copy_n(pixel, 4, rgba);
+                        break;
+                    case VideoFormat::PixelFormat::Rgbx:
+                        std::copy_n(pixel, 3, rgba); rgba[3] = 255;
+                        break;
+                    }
+                }
+            }
+            QByteArray png;
+            QBuffer buffer(&png);
+            if (buffer.open(QIODevice::WriteOnly) && image.save(&buffer, "PNG")) {
+                const auto base64 = png.toBase64();
+                send(wire::cursorImage(
+                    static_cast<double>(bitmap.width) / captureWidth_,
+                    static_cast<double>(bitmap.height) / captureHeight_,
+                    bitmap.width > 0 ? static_cast<double>(bitmap.hotspotX) / bitmap.width : 0.0,
+                    bitmap.height > 0 ? static_cast<double>(bitmap.hotspotY) / bitmap.height : 0.0,
+                    base64.toStdString()));
+            }
+        }
+    }
+
+    const std::pair<int, int> position{update.x, update.y};
+    if (cursorVisible_ != update.visible || (update.visible && lastCursorPosition_ != position)) {
+        const double x = captureWidth_ > 0
+            ? std::clamp(static_cast<double>(update.x) / captureWidth_, 0.0, 1.0) : 0.0;
+        const double y = captureHeight_ > 0
+            ? std::clamp(static_cast<double>(update.y) / captureHeight_, 0.0, 1.0) : 0.0;
+        send(wire::cursor(x, y, update.visible));
+        cursorVisible_ = update.visible;
+        if (update.visible) lastCursorPosition_ = position;
+        else lastCursorPosition_.reset();
+    }
 }
 
 void Session::receiveLoop() {
@@ -206,10 +286,17 @@ bool Session::tick() {
         throw std::runtime_error("PipeWire capture failed: " + *captureError);
     }
     std::deque<Event> events;
+    std::optional<CursorUpdate> cursor;
     {
         std::lock_guard lock(stateMutex_);
         events.swap(events_);
+        cursor.swap(pendingCursor_);
+        if (cursor && cursorBitmapDirty_ && cursorBitmap_) {
+            cursor->bitmap = cursorBitmap_;
+            cursorBitmapDirty_ = false;
+        }
     }
+    if (cursor) sendCursorUpdate(*cursor);
     for (const auto& event : events) {
         if (event.kind == EventKind::Touch) {
             desktop_->pointer(event.phase, event.x, event.y);
@@ -267,7 +354,12 @@ void Session::stop() {
         phone_.reset();
         activePhone_.reset();
         events_.clear();
+        pendingCursor_.reset();
+        cursorBitmap_.reset();
+        cursorBitmapDirty_ = false;
     }
+    cursorVisible_ = false;
+    lastCursorPosition_.reset();
     reconfigurePending_ = false;
 }
 

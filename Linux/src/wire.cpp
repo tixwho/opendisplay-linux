@@ -72,6 +72,23 @@ std::string pong(const double phoneTime, const double hostTime) {
     return QJsonDocument(object).toJson(QJsonDocument::Compact).toStdString();
 }
 
+std::string cursor(const double x, const double y, const bool visible) {
+    QJsonObject object{{QStringLiteral("type"), QStringLiteral("cursor")},
+                       {QStringLiteral("x"), x}, {QStringLiteral("y"), y},
+                       {QStringLiteral("v"), visible ? 1 : 0}};
+    return QJsonDocument(object).toJson(QJsonDocument::Compact).toStdString();
+}
+
+std::string cursorImage(const double width, const double height, const double anchorX,
+                        const double anchorY, const std::string_view pngBase64) {
+    QJsonObject object{{QStringLiteral("type"), QStringLiteral("cursorImg")},
+                       {QStringLiteral("nw"), width}, {QStringLiteral("nh"), height},
+                       {QStringLiteral("ax"), anchorX}, {QStringLiteral("ay"), anchorY},
+                       {QStringLiteral("png"), QString::fromUtf8(
+                           pngBase64.data(), static_cast<qsizetype>(pngBase64.size()))}};
+    return QJsonDocument(object).toJson(QJsonDocument::Compact).toStdString();
+}
+
 std::string videoPayload(const EncodedFrame& encoded, const std::int64_t sentAtMs) {
     const auto telemetry = std::string("{\"cap\":") + std::to_string(encoded.capturedAtMs)
         + ",\"snd\":" + std::to_string(sentAtMs) + "}";
